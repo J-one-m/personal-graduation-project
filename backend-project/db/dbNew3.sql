@@ -35,14 +35,20 @@ CREATE TABLE users (
   user_image VARCHAR(300) NULL,
   address VARCHAR(150) NULL,
   credit_score INT NOT NULL DEFAULT 10,
-  is_active TINYINT(1) DEFAULT 1,
-  last_login DATETIME NULL,
+  is_active TINYINT(1) DEFAULT 1,-- 是否封禁
+  last_login DATETIME NULL,-- 最后登录时间
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   deleted_at DATETIME NULL DEFAULT NULL,
   INDEX idx_username (username),
   INDEX idx_role (role)
 );
+
+-- 辅助字段：记录信誉变动时间
+ALTER TABLE users ADD COLUMN credit_updated_at DATETIME NULL COMMENT '信誉分最后变动时间';
+ALTER TABLE users 
+ADD COLUMN last_fulfillment_at DATETIME NULL COMMENT '最后一次成功履约(完成预约)的时间';
+
 INSERT INTO users 
 (user_account, `password`, role, username, phone_number, age, gender, mailbox, address, credit_score, is_active, last_login)
 VALUES 
@@ -122,6 +128,7 @@ CREATE TABLE waitlist_teams (
     slot_id BIGINT NOT NULL COMMENT '关联的时段ID',
     team_leader_id INT NOT NULL COMMENT '队长用户ID',
     team_size INT NOT NULL DEFAULT 1 COMMENT '队伍总人数',
+    -- 候补码以及邀请码建议改为255，用于业务拓展
     waitlist_code VARCHAR(32) NULL UNIQUE COMMENT '候补加入码',
     priority_score INT NOT NULL DEFAULT 0 COMMENT '优先级评分(信誉分等综合计算)',
     STATUS ENUM('waiting', 'success', 'failed', 'cancelled') DEFAULT 'waiting' COMMENT '状态:等待中/成功/失败/已取消',
@@ -129,6 +136,23 @@ CREATE TABLE waitlist_teams (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) COMMENT='预约候补队伍表';
+
+-- 候补队员成员表
+CREATE TABLE waitlist_members (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    waitlist_team_id BIGINT NOT NULL COMMENT '候补队伍ID',
+    user_id INT NOT NULL COMMENT '用户ID',
+    -- 建议增加一个状态，方便处理队员主动退出候补的情况
+    STATUS ENUM('active', 'withdrawn', 'promoted') DEFAULT 'active' COMMENT '成员状态:活跃/已退出/已晋升',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    
+    FOREIGN KEY (waitlist_team_id) REFERENCES waitlist_teams(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    UNIQUE KEY unique_member_per_team (waitlist_team_id, user_id)
+) COMMENT='候补队伍成员明细表';
+
+
 
 -- 时段表
 CREATE TABLE time_slots (
@@ -139,7 +163,7 @@ CREATE TABLE time_slots (
     creator_user_id INT NOT NULL COMMENT '创建者/发起人ID',
     reservation_type ENUM('single', 'group') NOT NULL DEFAULT 'single' COMMENT '预约类型:个人/团队',
     STATUS ENUM('pending','in_progress','completed','cancelled','no_show','failed') NOT NULL DEFAULT 'pending' COMMENT '状态:待开始/进行中/完成/取消/缺席/失败',
-    current_participants INT DEFAULT 1 COMMENT '当前已预约人数',
+    current_participants INT DEFAULT 0 COMMENT '当前已预约人数',
     max_participants INT DEFAULT 1 COMMENT '该时段最大容纳人数',
     invitation_code VARCHAR(32) NULL UNIQUE COMMENT '团队邀请码',
     waitlist_count INT NOT NULL DEFAULT 0 COMMENT '当前候补队伍数',
@@ -158,6 +182,15 @@ CREATE TABLE time_slots (
 ALTER TABLE waitlist_teams ADD FOREIGN KEY (slot_id) REFERENCES time_slots(id) ON DELETE CASCADE;
 ALTER TABLE waitlist_teams ADD FOREIGN KEY (team_leader_id) REFERENCES users(id);
 
+-- 补充字段
+ALTER TABLE time_slots 
+    ADD COLUMN penalty_level TINYINT DEFAULT 0 COMMENT '惩罚等级: 0-未扣, 1-迟到3min, 2-迟到6min, 3-缺席/踢出',
+    ADD COLUMN last_penalty_at DATETIME NULL COMMENT '最后一次扣分记录时间';
+
+ALTER TABLE time_slots 
+ADD COLUMN checked_in_at DATETIME NULL COMMENT '用户实际签到时间';
+
+
 -- 预约参与关系表
 CREATE TABLE slot_participants (
     slot_id BIGINT NOT NULL,
@@ -167,6 +200,13 @@ CREATE TABLE slot_participants (
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
+
+-- 补充：
+-- 防止一个人在同一个候补队里出现两次（这个一定要加！）
+ALTER TABLE waitlist_members ADD UNIQUE INDEX idx_team_user (waitlist_team_id, user_id);
+
+-- 防止一个人重复加入同一个正式预约
+ALTER TABLE slot_participants ADD UNIQUE INDEX idx_slot_user (slot_id, user_id);
 -- ---------------------------------------------------------
 -- 7. 补充业务表 (计划、公告、失物)
 -- ---------------------------------------------------------
@@ -246,6 +286,25 @@ VALUES
 
 
 
+-- 补充表
+-- 信誉分审计追踪表
+CREATE TABLE credit_logs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    slot_id BIGINT NULL COMMENT '关联的预约时段',
+    change_amount INT NOT NULL COMMENT '变动分数(如 -1)',
+    reason VARCHAR(255) NOT NULL COMMENT '扣分原因(如: 迟到3分钟内)',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (slot_id) REFERENCES time_slots(id) ON DELETE SET NULL
+) COMMENT='信誉分变动明细表';
+
+-- 修改现有 credit_logs 的字段注释并增加索引，方便统计
+ALTER TABLE credit_logs 
+MODIFY COLUMN change_amount INT NOT NULL COMMENT '变动分数: 正数为奖励, 负数为惩罚',
+ADD INDEX idx_user_created (user_id, created_at);
+
+
 -- ---------------------------------------------------------
 -- 8. 触发器
 -- ---------------------------------------------------------
@@ -293,106 +352,3 @@ SELECT*FROM slot_participants;
 SELECT*FROM user_plans;
 SELECT*FROM affiche;
 SELECT*FROM lost_property;
-
-
-
--- 查询场地或分类下当前时段的使用信息
-
-SELECT 
-  COUNT(creator_user_id) AS '当前使用数'
-FROM 
-  venue_categories vc
-JOIN
-  venues v ON vc.id = v.category_id
-JOIN
-  schedules s ON v.id = s.venue_id
-JOIN
-  time_slots ts ON s.id = ts.schedule_id
-WHERE
-  vc.id = 1 AND ts.start_time < '12:00:00' AND ts.end_time >= '12:00:00';
-  
-
-
-
-
-
-
--- 分类总览视图（宏观监控）
-SELECT 
-    vc.id AS category_id,
-    vc.name AS category_name,
-    vc.icon_mark,
-    -- 该类别下所有场地的总容量之和
-    SUM(v.capacity) AS total_capacity,
-    -- 该类别下所有场地当前正在使用的总人数之和
-    IFNULL(SUM(ts.current_participants), 0) AS current_load,
-    -- 该类别下一共有多少个碎片化场地（桌子/半场）
-    COUNT(DISTINCT v.id) AS total_venues
-FROM venue_categories vc
-LEFT JOIN venues v ON vc.id = v.category_id
-LEFT JOIN schedules s ON v.id = s.venue_id AND s.schedule_date = CURDATE()
-LEFT JOIN time_slots ts ON s.id = ts.schedule_id 
-    AND ts.start_time <= CURTIME() 
-    AND ts.end_time > CURTIME() 
-    AND ts.status IN ('pending', 'in_progress')
-GROUP BY vc.id, vc.name, vc.icon_mark;
-
-
--- 类别下明细视图（微观管理）
-SELECT 
-    v.id, 
-    v.venue_name, 
-    v.venue_address,
-    v.capacity,
-    vc.name AS category_name,
-    -- 仅代表这一个场地的当前人数
-    IFNULL(SUM(ts.current_participants), 0) AS current_load
-FROM venues v
-JOIN venue_categories vc ON v.category_id = vc.id
-LEFT JOIN schedules s ON v.id = s.venue_id AND s.schedule_date = CURDATE()
-LEFT JOIN time_slots ts ON s.id = ts.schedule_id 
-    AND ts.start_time <= CURTIME() 
-    AND ts.end_time > CURTIME() 
-    AND ts.status IN ('pending', 'in_progress')
--- 这里的条件是关键：传入具体的 category_id
-WHERE v.category_id = 1 
-GROUP BY v.id, vc.name;
-
-
--- 获取用户预约记录
-
-SELECT 
-ts.id AS timeSlotId,
-v.venue_name,
-v.venue_address,
-s.schedule_date,
-ts.status,
-ts.start_time,
-ts.end_time,
-ts.reservation_type,
-ts.current_participants,
-ts.max_participants,
-ts.creator_user_id,
-CASE
-    WHEN ts.creator_user_id = 8 THEN 'creator'
-    ELSE 'participant'
-END AS role
-FROM (
-SELECT 
-    ts.*
-FROM time_slots ts
-WHERE ts.creator_user_id = 8
-AND ts.record_source = 'direct_booking'
-
-UNION ALL
-
-SELECT 
-    ts.*
-FROM slot_participants sp
-JOIN time_slots ts ON sp.slot_id = ts.id
-WHERE sp.user_id = 8
-AND ts.record_source = 'direct_booking'
-) AS ts
-JOIN schedules s ON ts.schedule_id = s.id
-JOIN venues v ON s.venue_id = v.id
-ORDER BY ts.id DESC;
